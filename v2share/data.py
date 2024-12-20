@@ -5,8 +5,53 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 from uuid import UUID
 
-from v2share._utils import filter_dict
+from v2share._utils import filter_dict, set_path_early_data
 from v2share.exceptions import ProtocolNotSupportedError
+
+
+@dataclass
+class XrayNoise:
+    type: str
+    packet: str
+    delay: str
+
+
+@dataclass
+class XMuxSettings:
+    max_concurrency: Optional[str] = None
+    max_connections: Optional[str] = None
+    max_reuse_times: Optional[str] = None
+    max_lifetime: Optional[str] = None
+
+
+@dataclass
+class SplitHttpSettings:
+    mode: Optional[str] = None
+    no_grpc_header: Optional[bool] = None
+    padding_bytes: Optional[str] = None
+    xmux: Optional[XMuxSettings] = None
+
+
+@dataclass
+class SingBoxMuxSettings:
+    max_connections: Optional[int] = None
+    min_streams: Optional[int] = None
+    max_streams: Optional[int] = None
+    padding: Optional[bool] = None
+
+
+@dataclass
+class MuxCoolSettings:
+    concurrency: Optional[int] = None
+    xudp_concurrency: Optional[int] = None
+    xudp_proxy_443: Optional[str] = None
+
+
+@dataclass
+class MuxSettings:
+    protocol: str = "mux_cool"
+    sing_box_mux_settings: Optional[SingBoxMuxSettings] = None
+    mux_cool_settings: Optional[MuxCoolSettings] = None
 
 
 @dataclass
@@ -23,7 +68,8 @@ class V2Data:
     host: Optional[str] = None
     http_headers: Dict[str, str] = field(default_factory=dict)
     transport_type: str = "tcp"
-    grpc_multi_mode: bool = False
+    grpc_multi_mode: Optional[bool] = None
+    grpc_user_agent: Optional[str] = None
     path: Optional[str] = None
     header_type: Optional[str] = None
     tls: str = "none"
@@ -39,15 +85,21 @@ class V2Data:
     fragment_packets: str = "tlshello"
     fragment_length: str = "100-200"
     fragment_interval: str = "10-20"
+    xray_noises: Optional[List[XrayNoise]] = None
+    early_data: Optional[int] = None
     mtu: Optional[int] = None
     dns_servers: Optional[List[str]] = None
     allowed_ips: Optional[List[str]] = None
     congestion_control: Optional[str] = None
     tuic_udp_relay_mode: Optional[str] = None
+    shadowtls_version: Optional[int] = None
     disable_sni: bool = False
     enable_mux: bool = False
     allow_insecure: bool = False
     weight: int = 1
+    next: Optional["V2Data"] = None
+    splithttp_settings: Optional[SplitHttpSettings] = None
+    mux_settings: MuxSettings = field(default_factory=MuxSettings)
 
     def _apply_tls_settings(self, payload):
         if self.tls in ["tls", "reality"]:
@@ -87,6 +139,16 @@ class V2Data:
             transport_data = {"key": self.path, "quicSecurity": self.host}
         else:
             transport_data = {"path": self.path, "host": self.host}
+            if self.transport_type in {"ws", "httpupgrade"} and self.early_data:
+                transport_data["path"] = set_path_early_data(
+                    transport_data.get("path", "/"), self.early_data
+                )
+            if (
+                self.transport_type == "splithttp"
+                and self.splithttp_settings
+                and self.splithttp_settings.mode is not None
+            ):
+                transport_data["mode"] = self.splithttp_settings.mode
 
         payload.update(transport_data)
 

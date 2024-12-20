@@ -7,18 +7,21 @@ from v2share.base import BaseConfig
 from v2share.data import V2Data
 from v2share.exceptions import ProtocolNotSupportedError, TransportNotSupportedError
 
-supported_protocols = [
-    "shadowsocks",
-    "vmess",
-    "trojan",
-    "vless",
-    "hysteria2",
-    "wireguard",
-]
-supported_transports = ["tcp", "ws", "quic", "httpupgrade", "grpc", None]
-
 
 class SingBoxConfig(BaseConfig):
+    chaining_support = True
+    supported_protocols = [
+        "shadowsocks",
+        "vmess",
+        "trojan",
+        "vless",
+        "hysteria2",
+        "wireguard",
+        "shadowtls",
+        "tuic",
+    ]
+    supported_transports = ["tcp", "ws", "quic", "httpupgrade", "grpc", "http", None]
+
     def __init__(self, template_path: str = None, swallow_errors=True):
         if not template_path:
             template_path = resources.files("v2share.templates") / "singbox.json"
@@ -32,12 +35,25 @@ class SingBoxConfig(BaseConfig):
         if shuffle is True:
             configs = random.sample(self._configs, len(self._configs))
         elif sort is True:
-            configs = sorted(self._configs, key=lambda config: config.weight)
+            configs = sorted(self._configs, key=lambda c: c.weight)
         else:
             configs = self._configs
 
         result = json.loads(self._template_data)
-        result["outbounds"].extend([self.create_outbound(config) for config in configs])
+
+        blackset = set()
+        for config in configs:
+            c = config
+            while True:
+                outbound = self.create_outbound(c)
+                if c.next:
+                    outbound["detour"] = config.next.remark
+                    blackset.add(c.next.remark)
+                    c = config.next
+                    result["outbounds"].append(outbound)
+                else:
+                    result["outbounds"].append(outbound)
+                    break
 
         urltest_types = [
             "hysteria2",
@@ -46,11 +62,13 @@ class SingBoxConfig(BaseConfig):
             "trojan",
             "shadowsocks",
             "wireguard",
+            "tuic",
+            "shadowtls",
         ]
         urltest_tags = [
             outbound["tag"]
             for outbound in result["outbounds"]
-            if outbound["type"] in urltest_types
+            if outbound["type"] in urltest_types and outbound["tag"] not in blackset
         ]
         selector_types = [
             "hysteria2",
@@ -59,12 +77,14 @@ class SingBoxConfig(BaseConfig):
             "trojan",
             "shadowsocks",
             "wireguard",
+            "tuic",
+            "shadowtls",
             "urltest",
         ]
         selector_tags = [
             outbound["tag"]
             for outbound in result["outbounds"]
-            if outbound["type"] in selector_types
+            if outbound["type"] in selector_types and outbound["tag"] not in blackset
         ]
 
         for outbound in result["outbounds"]:
@@ -113,13 +133,14 @@ class SingBoxConfig(BaseConfig):
         path=None,
         http_method=None,
         headers=None,
+        early_data=None,
     ):
         if headers is None:
             headers = {}
 
         transport_config = {"type": transport_type}
 
-        if transport_type == "tcp":
+        if transport_type in {"http", "tcp"}:
             transport_config["type"] = "http"
             transport_config["headers"] = headers
             if host:
@@ -131,13 +152,11 @@ class SingBoxConfig(BaseConfig):
         elif transport_type == "ws":
             transport_config["headers"] = headers
             if path:
-                if "?ed=" in path:
-                    path, max_early_data = path.split("?ed=")
-                    max_early_data = int(max_early_data)
+                if early_data:
                     transport_config["early_data_header_name"] = (
                         "Sec-WebSocket-Protocol"
                     )
-                    transport_config["max_early_data"] = max_early_data
+                    transport_config["max_early_data"] = early_data
                 transport_config["path"] = path
             if host:
                 transport_config["headers"]["Host"] = host
@@ -168,12 +187,15 @@ class SingBoxConfig(BaseConfig):
         ):
             outbound["flow"] = config.flow
 
-        if config.transport_type in ["tcp", "ws", "quic", "grpc", "httpupgrade"]:
+        if config.transport_type in ["ws", "quic", "grpc", "httpupgrade", "http"] or (
+            config.transport_type == "tcp" and config.header_type == "http"
+        ):
             outbound["transport"] = SingBoxConfig.transport_config(
                 transport_type=config.transport_type,
                 host=config.host,
                 path=config.path,
                 headers=config.http_headers,
+                early_data=config.early_data,
             )
 
         if config.tls in ("tls", "reality"):
@@ -216,6 +238,29 @@ class SingBoxConfig(BaseConfig):
                     ],
                 }
             )
+        elif config.protocol == "shadowtls":
+            if config.shadowtls_version:
+                outbound["version"] = config.shadowtls_version
+                if config.shadowtls_version in {2, 3}:
+                    outbound["password"] = config.password
+        elif config.protocol == "tuic":
+            outbound["password"] = config.password
+            outbound["uuid"] = str(config.uuid)
+
+        if config.enable_mux is True and config.mux_settings.protocol in {
+            "h2mux",
+            "yamux",
+            "smux",
+        }:
+            outbound["mux"] = {"enabled": True}
+            if config.mux_settings.sing_box_mux_settings is not None:
+                for k, v in {
+                    "max_connections": config.mux_settings.sing_box_mux_settings.max_connections,
+                    "min_streams": config.mux_settings.sing_box_mux_settings.min_streams,
+                    "max_streams": config.mux_settings.sing_box_mux_settings.max_streams,
+                }.items():
+                    if v is not None:
+                        outbound["mux"][k] = v
         return outbound
 
     def add_proxies(self, proxies: List[V2Data]):
@@ -223,8 +268,10 @@ class SingBoxConfig(BaseConfig):
             # validation
             if (
                 unsupported_transport := proxy.transport_type
-                not in supported_transports
-            ) or (unsupported_protocol := proxy.protocol not in supported_protocols):
+                not in self.supported_transports
+            ) or (
+                unsupported_protocol := proxy.protocol not in self.supported_protocols
+            ):
                 if self._swallow_errors:
                     continue
                 if unsupported_transport:
